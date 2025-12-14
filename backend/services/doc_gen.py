@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import List, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-
+from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse,FileResponse
 from pydantic import BaseModel, Field
@@ -26,6 +26,8 @@ router = APIRouter()
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
+
+load_dotenv()
 
 SKIP_PATTERNS = {
     "dirs": {
