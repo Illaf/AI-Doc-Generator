@@ -1,5 +1,5 @@
 import os
-import tempfile
+import tempfile,time
 import shutil
 import asyncio,uuid
 from pathlib import Path
@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse,FileResponse
 from pydantic import BaseModel, Field
+from utils.list_branches import list_remote_branches,branch_exists
 import git
 import ollama
 import ast
@@ -69,6 +70,9 @@ class GenerateRequest(BaseModel):
     format: str = "md"
     theme: Optional[str] = None
 
+class BranchRequest(BaseModel):
+    repo_url: str
+    access_token: Optional[str] = None
 
 @router.post("/start-generation")
 def start_generation(req: GenerateRequest, background_tasks: BackgroundTasks):
@@ -111,15 +115,16 @@ def should_skip(path: Path) -> bool:
     return False
 
 
-def safe_rmtree(path: str):
-    """Cross-platform safe directory removal"""
-    def on_error(func, p, exc):
-        os.chmod(p, 0o777)
-        func(p)
-    
-    if os.path.exists(path):
-        shutil.rmtree(path, onerror=on_error)
+def safe_rmtree(path: str, retries=5):
+    for i in range(retries):
+        try:
+            shutil.rmtree(path, ignore_errors=False)
+            return
+        except PermissionError:
+            time.sleep(1)
+    shutil.rmtree(path, ignore_errors=True)
 
+   
 
 def clone_repository(url: str, branch: str, token: Optional[str], dest: str) -> git.Repo:
     """Clone repository with authentication support"""
@@ -286,11 +291,15 @@ def worker_generate_docs(job_id: str, req: GenerateRequest):
     try:
         job_store[job_id]["status"] = "Cloning repository"
         job_store[job_id]["progress"] = 10
+        
+        # validate branch
+        if not branch_exists(req.repo_url, req.branch, req.access_token):
+            raise Exception(f"Branch '{req.branch}' does not exist in repository")
 
         repo = clone_repository(req.repo_url, req.branch, req.access_token, tmp_dir)
         repo.git.clear_cache()
         repo.close()
-
+        del repo
         repo_path = Path(tmp_dir)
 
         # Commit hash
@@ -299,9 +308,9 @@ def worker_generate_docs(job_id: str, req: GenerateRequest):
         # Check cache
         cached = get_cached_doc(db, req.repo_url, req.branch, commit_hash)
         if cached:
-            job_store[job_id]["status"] = "Loaded from cache"
+            job_store[job_id]["status"] = "Completed"
             job_store[job_id]["progress"] = 100
-            job_store[job_id]["output_file"] = cached.file_path
+            job_store[job_id]["output_file"] = cached.doc_path
             return
 
         # Process files
@@ -356,10 +365,14 @@ def worker_generate_docs(job_id: str, req: GenerateRequest):
         job_store[job_id]["status"] = "Failed"
 
     finally:
-        safe_rmtree(tmp_dir)
-        db.close()
-
-
+        try:
+            import time
+            time.sleep(0.5)  # allow PDF writer to release lock
+            safe_rmtree(tmp_dir)
+        except Exception as cleanup_error:
+            print(f"Cleanup error: {cleanup_error}")
+        finally:
+            db.close()
 
 
 @router.get("/health")
@@ -392,7 +405,21 @@ def download(job_id: str):
 
     return FileResponse(job["output_file"])
 
+@router.post("/list-branches")
+def list_branches(req: BranchRequest):
+    try:
+        branches = list_remote_branches(req.repo_url, req.access_token)
+        if not branches:
+            raise HTTPException(400, "No branches found")
 
+        return {
+            "default": "main" if "main" in branches else branches[0],
+            "branches": branches
+        }
+
+    except Exception as e:
+        raise HTTPException(400, str(e))
+ 
 
 @router.get("/")
 def root():

@@ -17,6 +17,9 @@ export default function GenerateDocsPage() {
   const [status, setStatus] = useState("");
   const [progress, setProgress] = useState(0);
   const [downloadReady, setDownloadReady] = useState(false);
+  const [branchList,setBranchList] = useState<string[]>([])
+  const [selectedBranch, setSelectedBranch] = useState<string>("");
+  const [loadingBranches, setLoadingBranches] = useState(false);
   async function startGeneration() {
     if (!repo) return;
   
@@ -29,7 +32,7 @@ export default function GenerateDocsPage() {
       },
       body: JSON.stringify({
         repo_url: `https://github.com/${repo}.git`,
-        branch: "main",
+        branch: selectedBranch,
         theme,
         model,
         format,
@@ -42,6 +45,37 @@ export default function GenerateDocsPage() {
     setLoading(false);
   }
   useEffect(() => {
+    if (!repo) return;
+  
+    async function fetchBranches() {
+      setLoadingBranches(true);
+  
+      try {
+        const resp = await fetch("http://localhost:8000/list-branches", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            repo_url: `https://github.com/${repo}.git`,
+          }),
+        });
+  
+        const data = await resp.json();
+  
+        setBranchList(data.branches || []);
+        setSelectedBranch(data.default || "");
+      } catch (err) {
+        console.error("Failed to fetch branches", err);
+      } finally {
+        setLoadingBranches(false);
+      }
+    }
+  
+    fetchBranches();
+  }, [repo]);
+  
+  useEffect(() => {
     if (!jobId) return;
   
     const interval = setInterval(async () => {
@@ -53,7 +87,7 @@ export default function GenerateDocsPage() {
       setStatus(data.status);
       setProgress(data.progress || 0);
   
-      if (data.status === "Completed") {
+      if (data.status === "Completed" || data.status === "Loaded from cache") {
         setDownloadReady(true);
         clearInterval(interval);
       }
@@ -70,13 +104,37 @@ export default function GenerateDocsPage() {
   return (
     <>
       <Navbar />
+    <div>
 
+    </div>
       <div className="max-w-3xl mx-auto mt-12 px-4">
         <h1 className="text-3xl font-bold">Generate Documentation</h1>
 
         <p className="text-gray-500 mt-2">
           Repository: <span className="font-medium">{repo}</span>
         </p>
+{/* Branch */}
+<div className="mt-6">
+  <label className="block text-sm font-medium mb-1">
+    Branch
+  </label>
+
+  {loadingBranches ? (
+    <p className="text-sm text-gray-500">Loading branches...</p>
+  ) : (
+    <select
+      value={selectedBranch}
+      onChange={(e) => setSelectedBranch(e.target.value)}
+      className="w-full border rounded p-2"
+    >
+      {branchList.map((branch) => (
+        <option key={branch} value={branch}>
+          {branch}
+        </option>
+      ))}
+    </select>
+  )}
+</div>
 
         {/* Theme */}
         <div className="mt-6">

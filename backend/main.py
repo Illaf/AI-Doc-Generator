@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from services.doc_gen import router
 from services.auth import auth_router
+from routers.docs import doc_router
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -15,3 +16,4 @@ app.add_middleware(
 )
 app.include_router(router)  # no prefix
 app.include_router(auth_router)
+app.include_router(doc_router)
