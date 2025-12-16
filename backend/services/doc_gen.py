@@ -392,18 +392,56 @@ def get_status(job_id:str):
 
 @router.get("/download/{job_id}")
 def download(job_id: str):
+    """
+    Download the generated documentation file.
+    Returns the file with appropriate headers for browser download.
+    """
     job = job_store.get(job_id)
 
     if not job:
-        raise HTTPException(404, "Invalid job_id")
+        raise HTTPException(status_code=404, detail="Invalid job_id")
 
-    if job["error"]:
-        raise HTTPException(500, job["error"])
+    if job.get("error"):
+        raise HTTPException(status_code=500, detail=job["error"])
 
     if job["status"] != "Completed":
-        return {"status": job["status"], "progress": job["progress"]}
+        raise HTTPException(
+            status_code=425,
+            detail=f"Document not ready yet. Status: {job['status']}, Progress: {job['progress']}%"
+        )
 
-    return FileResponse(job["output_file"])
+    output_file = job.get("output_file")
+    
+    if not output_file or not os.path.exists(output_file):
+        raise HTTPException(status_code=404, detail="Generated file not found")
+
+    # Determine file extension and media type
+    file_format = job.get("format", "md")
+    repo_name = job.get("repo_name", "documentation")
+    
+    # Map format to media type
+    media_type_map = {
+        "md": "text/markdown",
+        "pdf": "application/pdf",
+        "html": "text/html",
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "txt": "text/plain"
+    }
+    
+    media_type = media_type_map.get(file_format, "application/octet-stream")
+    
+    # Create a friendly filename
+    filename = f"{repo_name}_documentation.{file_format}"
+    
+    return FileResponse(
+        path=output_file,
+        media_type=media_type,
+        filename=filename,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-cache"
+        }
+    )
 
 @router.post("/list-branches")
 def list_branches(req: BranchRequest):

@@ -104,124 +104,151 @@ export default function GenerateDocsPage() {
   return (
     <>
       <Navbar />
-    <div>
-
-    </div>
-      <div className="max-w-3xl mx-auto mt-12 px-4">
-        <h1 className="text-3xl font-bold">Generate Documentation</h1>
-
-        <p className="text-gray-500 mt-2">
-          Repository: <span className="font-medium">{repo}</span>
-        </p>
-{/* Branch */}
-<div className="mt-6">
-  <label className="block text-sm font-medium mb-1">
-    Branch
-  </label>
-
-  {loadingBranches ? (
-    <p className="text-sm text-gray-500">Loading branches...</p>
-  ) : (
-    <select
-      value={selectedBranch}
-      onChange={(e) => setSelectedBranch(e.target.value)}
-      className="w-full border rounded p-2"
-    >
-      {branchList.map((branch) => (
-        <option key={branch} value={branch}>
-          {branch}
-        </option>
-      ))}
-    </select>
-  )}
-</div>
-
-        {/* Theme */}
-        <div className="mt-6">
-          <label className="block text-sm font-medium mb-1">
-            Documentation Theme
-          </label>
-          <select
-            value={theme}
-            onChange={(e) => setTheme(e.target.value)}
-            className="w-full border rounded p-2"
-          >
-            <option value="default">Default (Simple)</option>
-            <option value="technical">Technical</option>
-            <option value="beginner">Beginner Friendly</option>
-            <option value="api">API Reference</option>
-          </select>
+  
+      {/* Page background */}
+      <div className="min-h-screen bg-gray-50 py-12 px-4">
+        <div className="max-w-4xl mx-auto">
+  
+          {/* Header */}
+          <div className="mb-8">
+            <h1 className="text-4xl font-bold text-gray-900">
+              Generate Documentation
+            </h1>
+            <p className="text-gray-600 mt-2">
+              Repository:{" "}
+              <span className="font-medium text-gray-900">{repo}</span>
+            </p>
+          </div>
+  
+          {/* Main Card */}
+          <div className="bg-white rounded-2xl shadow-lg p-8 space-y-6">
+  
+            {/* Branch */}
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Branch
+              </label>
+  
+              {loadingBranches ? (
+                <p className="text-sm text-gray-500">Loading branches...</p>
+              ) : (
+                <select
+                  value={selectedBranch}
+                  onChange={(e) => setSelectedBranch(e.target.value)}
+                  className="w-full rounded-lg border border-gray-300 px-3 py-2
+                             focus:outline-none focus:ring-2 focus:ring-gray-900"
+                >
+                  {branchList.map((branch) => (
+                    <option key={branch} value={branch}>
+                      {branch}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </div>
+  
+            {/* Theme */}
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Documentation Theme
+              </label>
+              <select
+                value={theme}
+                onChange={(e) => setTheme(e.target.value)}
+                className="w-full rounded-lg border border-gray-300 px-3 py-2
+                           focus:outline-none focus:ring-2 focus:ring-gray-900"
+              >
+                <option value="default">Default (Simple)</option>
+                <option value="technical">Technical</option>
+                <option value="beginner">Beginner Friendly</option>
+                <option value="api">API Reference</option>
+              </select>
+            </div>
+  
+            {/* Model + Format (2-column layout) */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+  
+              {/* Model */}
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Model
+                </label>
+                <select
+                  value={model}
+                  onChange={(e) => setModel(e.target.value)}
+                  className="w-full rounded-lg border border-gray-300 px-3 py-2
+                             focus:outline-none focus:ring-2 focus:ring-gray-900"
+                >
+                  <option value="llama3.2">LLaMA 3.2</option>
+                  <option value="llama3">LLaMA 3</option>
+                  <option value="mistral">Mistral</option>
+                </select>
+              </div>
+  
+              {/* Format */}
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Output Format
+                </label>
+                <select
+                  value={format}
+                  onChange={(e) => setFormat(e.target.value)}
+                  className="w-full rounded-lg border border-gray-300 px-3 py-2
+                             focus:outline-none focus:ring-2 focus:ring-gray-900"
+                >
+                  <option value="md">Markdown</option>
+                  <option value="pdf">PDF</option>
+                  <option value="docx">Word</option>
+                </select>
+              </div>
+            </div>
+  
+            {/* Generate Button */}
+            <div className="pt-4">
+              <Button
+                onClick={startGeneration}
+                disabled={loading}
+                className="w-full bg-gray-900 hover:bg-black text-white py-3
+                           rounded-xl text-lg transition"
+              >
+                {loading ? "Starting..." : "Start Generation"}
+              </Button>
+            </div>
+  
+            {/* Progress */}
+            {jobId && (
+              <div className="pt-4">
+                <p className="font-medium text-gray-800">{status}</p>
+  
+                <div className="w-full bg-gray-200 rounded-full h-3 mt-2 overflow-hidden">
+                  <div
+                    className="bg-green-600 h-3 transition-all duration-300"
+                    style={{ width: `${progress}%` }}
+                  />
+                </div>
+  
+                <p className="text-sm text-gray-500 mt-1">
+                  {progress}%
+                </p>
+              </div>
+            )}
+  
+            {/* Download */}
+            {downloadReady && (
+              <a
+                href={`http://localhost:8000/download/${jobId}`}
+                className="block"
+              >
+                <Button className="w-full bg-green-600 hover:bg-green-700
+                                   text-white py-3 rounded-xl text-lg transition">
+                  Download Documentation
+                </Button>
+              </a>
+            )}
+          </div>
         </div>
-
-        {/* Model */}
-        <div className="mt-4">
-          <label className="block text-sm font-medium mb-1">
-            Model
-          </label>
-          <select
-            value={model}
-            onChange={(e) => setModel(e.target.value)}
-            className="w-full border rounded p-2"
-          >
-            <option value="llama3.2">LLaMA 3.2</option>
-            <option value="llama3">LLaMA 3</option>
-            <option value="mistral">Mistral</option>
-          </select>
-        </div>
-
-        {/* Format */}
-        <div className="mt-4">
-          <label className="block text-sm font-medium mb-1">
-            Output Format
-          </label>
-          <select
-            value={format}
-            onChange={(e) => setFormat(e.target.value)}
-            className="w-full border rounded p-2"
-          >
-            <option value="md">Markdown</option>
-            <option value="pdf">PDF</option>
-            <option value="docx">Word</option>
-          </select>
-        </div>
-
-        {/* Generate */}
-        <Button
-          className="mt-8 bg-gray-900 hover:bg-black"
-          onClick={startGeneration}
-          disabled={loading}
-        >
-          {loading ? "Starting..." : "Start Generation"}
-        </Button>
-        {jobId && (
-  <div className="mt-8">
-    <p className="font-medium">{status}</p>
-
-    <div className="w-full bg-gray-200 rounded h-3 mt-2">
-      <div
-        className="bg-green-600 h-3 rounded transition-all"
-        style={{ width: `${progress}%` }}
-      />
-    </div>
-
-    <p className="text-sm text-gray-500 mt-1">
-      {progress}%
-    </p>
-  </div>
-)}
-{downloadReady && (
-  <a
-    href={`http://localhost:8000/download/${jobId}`}
-    className="inline-block mt-6"
-  >
-    <Button className="bg-green-600 hover:bg-green-700">
-      Download Documentation
-    </Button>
-  </a>
-)}
-
       </div>
-      
     </>
   );
+  
 }
