@@ -6,13 +6,44 @@ import Navbar from "@/components/Navbar";
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 
+function extractRepoFromUrl(githubUrl: string) {
+  try {
+    const urlObj = new URL(githubUrl.trim());
+    // pathname looks like: /anmode/grabtern-backend
+    const parts = urlObj.pathname.split("/").filter(Boolean);
+
+    if (parts.length < 2) return null;
+
+    return `${parts[0]}/${parts[1]}`;
+  } catch {
+    return null;
+  }
+}
+
+
 export default function Dashboard() {
   const [githubLinked, setGithubLinked] = useState(false);
   const [repos, setRepos] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [url, setUrl] = useState("")
+  const [urlBox,setShowUrlBox] = useState(false)
   const router = useRouter();
 
+
+  const generateFromUrl = () => {
+    const repoFullName = extractRepoFromUrl(url);
+  
+    if (!repoFullName) {
+      alert("Please enter a valid GitHub repository URL");
+      return;
+    }
+  
+    router.push(
+      `/dashboard/generate?repo=${encodeURIComponent(repoFullName)}`
+    );
+  };
+  
   // Detect redirect success
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -32,7 +63,7 @@ export default function Dashboard() {
     }
     window.location.href = `http://localhost:8000/github/connect?token=${token}`;
   }
-
+console.log(url)
   async function fetchRepos() {
     const token = localStorage.getItem("access_token");
     if (!token) {
@@ -57,6 +88,7 @@ export default function Dashboard() {
 
       const data = await resp.json();
       setRepos(data.repos);
+      console.log("repos",data.repos)
     } catch (err:any) {
       setError(err.message);
     } finally {
@@ -75,13 +107,32 @@ export default function Dashboard() {
             <p className="mt-4 text-gray-500">
               Connect your GitHub to start generating documentation.
             </p>
-
+          <div >
+            <p onClick={() => setShowUrlBox(!urlBox)} className="mt-4 text-emerald-500 hover:underline cursor-pointer"> Paste a URL</p>
+            {urlBox && 
+            <div className="flex flex-row">
+<input type="text" className="p-2 w-[450px] border-black border-2 rounded-md"
+value={url}
+onChange={(e) => setUrl(e.target.value)}
+/>
+<Button
+  size="sm"
+  className="mt-3 cursor-pointer"
+  onClick={generateFromUrl}
+>
+  Generate Docs →
+</Button>
+            </div>
+            }
+            <p className="mt-2 ">Or</p>
             <Button
               className="mt-6 bg-gray-900 hover:bg-black"
               onClick={connectGithub}
             >
               Connect GitHub
             </Button>
+          </div>
+           
           </div>
         )}
 
@@ -105,6 +156,7 @@ export default function Dashboard() {
         )}
 
         {repos.length > 0 && (
+        
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-10">
             {repos.map((repo:any) => (
               <div
@@ -136,12 +188,15 @@ export default function Dashboard() {
                 >
                   View on GitHub →
                 </a>
+                
                 <Button
   size="sm"
   className="mt-3 cursor-pointer"
+
   onClick={() =>
     router.push(
       `/dashboard/generate?repo=${encodeURIComponent(repo.full_name)}`
+      
     )
   }
 >

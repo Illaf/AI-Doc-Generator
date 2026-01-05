@@ -20,9 +20,11 @@ export default function GenerateDocsPage() {
   const [branchList,setBranchList] = useState<string[]>([])
   const [selectedBranch, setSelectedBranch] = useState<string>("");
   const [loadingBranches, setLoadingBranches] = useState(false);
+ 
   async function startGeneration() {
     if (!repo) return;
-  
+    
+    
     setLoading(true);
   
     const resp = await fetch("http://localhost:8000/start-generation", {

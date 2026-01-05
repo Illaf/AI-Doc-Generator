@@ -7,11 +7,12 @@ import Link from "next/link";
 
 export default function Register() {
   const [email, setEmail] = useState("");
+  const [name, setName] = useState("");
   const [password, setPassword] = useState("");
 
   const registerUser = async () => {
     try {
-      await api.post("/auth/register", { email, password });
+      await api.post("/auth/signup", { name,email, password });
       alert("Account Created! You can login now.");
       window.location.href = "/auth/login";
     } catch (err) {
@@ -22,10 +23,11 @@ export default function Register() {
   return (
     <div className="h-screen flex items-center justify-center bg-gray-50">
       <div className="bg-white shadow-xl rounded-xl p-8 w-[400px]">
-        <h2 className="text-3xl font-bold text-center mb-6">Create Account</        h2>
+        <h2 className="text-3xl font-bold text-center mb-6">Create Account</h2>
 
         <div className="space-y-4">
           <Input placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} />
+          <Input placeholder="Name" value={name} onChange={(e) => setName(e.target.value)} />
           <Input placeholder="Password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
 
           <Button className="w-full bg-indigo-600 hover:bg-indigo-700" onClick={registerUser}>
