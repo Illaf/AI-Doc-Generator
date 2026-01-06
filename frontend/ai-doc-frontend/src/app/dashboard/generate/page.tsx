@@ -95,6 +95,7 @@ export default function GenerateDocsPage() {
       }
   
       if (data.status === "Failed") {
+        console.log(data.error)
         alert(data.error || "Generation failed");
         clearInterval(interval);
       }

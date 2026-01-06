@@ -127,16 +127,137 @@ def safe_rmtree(path: str, retries=5):
    
 
 def clone_repository(url: str, branch: str, token: Optional[str], dest: str) -> git.Repo:
-    """Clone repository with authentication support"""
+    """Clone repository with authentication support, handling Windows filesystem limitations"""
     if token and url.startswith("https://"):
         url = url.replace("https://", f"https://{token}@")
     
-    return git.Repo.clone_from(
-        url, dest, branch=branch, depth=1,
-        single_branch=True,  # Only clone target branch
-        allow_unsafe_options=True,
-        config='core.autocrlf=false'  # Faster on Windows
-    )
+    # First attempt: Try with Windows protections disabled
+    try:
+        repo = git.Repo.clone_from(
+            url, 
+            dest, 
+            branch=branch,
+            depth=1,
+            single_branch=True,
+            allow_unsafe_options=True,
+            env={
+                'GIT_CONFIG_PARAMETERS': "'core.autocrlf=false' 'core.protectNTFS=false' 'core.protectHFS=false'"
+            }
+        )
+        return repo
+    except git.GitCommandError as e:
+        error_msg = str(e)
+        
+        # Check if it's a Windows path issue (colons, invalid chars)
+        if "invalid path" in error_msg or "unable to checkout working tree" in error_msg:
+            print(f"Checkout failed due to invalid filenames. Using sparse checkout to skip media files: {e}")
+            
+            # Remove the failed directory
+            if os.path.exists(dest):
+                safe_rmtree(dest)
+            
+            # Initialize empty repo
+            os.makedirs(dest, exist_ok=True)
+            repo = git.Repo.init(dest)
+            
+            # Add remote
+            origin = repo.create_remote('origin', url)
+            
+            # Enable sparse checkout in pattern mode
+            repo.git.config('core.sparseCheckout', 'true')
+            repo.git.config('core.sparseCheckoutCone', 'false')
+            
+            # Configure sparse checkout: include code, exclude media
+            sparse_file = os.path.join(dest, '.git', 'info', 'sparse-checkout')
+            with open(sparse_file, 'w') as f:
+                # Use a wildcard approach: include everything first
+                f.write('/*\n')
+                f.write('/**/*\n')
+                f.write('\n')
+                # Then exclude media files (! means exclude)
+                # Images
+                f.write('!*.jpg\n')
+                f.write('!*.jpeg\n')
+                f.write('!*.png\n')
+                f.write('!*.gif\n')
+                f.write('!*.bmp\n')
+                f.write('!*.svg\n')
+                f.write('!*.ico\n')
+                f.write('!*.webp\n')
+                f.write('!*.tiff\n')
+                f.write('!*.tif\n')
+                # Videos
+                f.write('!*.mp4\n')
+                f.write('!*.avi\n')
+                f.write('!*.mov\n')
+                f.write('!*.wmv\n')
+                f.write('!*.flv\n')
+                f.write('!*.mkv\n')
+                f.write('!*.webm\n')
+                f.write('!*.m4v\n')
+                f.write('!*.mpg\n')
+                f.write('!*.mpeg\n')
+                # Audio
+                f.write('!*.mp3\n')
+                f.write('!*.wav\n')
+                f.write('!*.flac\n')
+                f.write('!*.aac\n')
+                f.write('!*.ogg\n')
+                f.write('!*.m4a\n')
+                f.write('!*.wma\n')
+                # Archives
+                f.write('!*.zip\n')
+                f.write('!*.tar\n')
+                f.write('!*.gz\n')
+                f.write('!*.rar\n')
+                f.write('!*.7z\n')
+                # Binaries
+                f.write('!*.exe\n')
+                f.write('!*.dll\n')
+                f.write('!*.bin\n')
+                f.write('!*.dmg\n')
+                f.write('!*.pkg\n')
+            
+            # Disable protections and fetch
+            repo.git.config('core.protectNTFS', 'false')
+            repo.git.config('core.protectHFS', 'false')
+            
+            # Fetch the specific branch with sparse checkout
+            try:
+                origin.fetch(branch, depth=1)
+                # Checkout the branch
+                repo.git.checkout(f'origin/{branch}')
+            except git.GitCommandError as fetch_error:
+                # If still failing, do a no-checkout fetch and manual read
+                print(f"Sparse checkout also failed, using no-checkout mode: {fetch_error}")
+                origin.fetch(branch, depth=1, no_checkout=True)
+                # Create a minimal working tree with just Python files
+                repo.git.checkout(f'origin/{branch}', '--', '*.py', force=True)
+            
+            return repo
+        else:
+            # For other errors, try alternative method
+            print(f"Clone failed for other reason, trying alternative: {e}")
+            
+            if os.path.exists(dest):
+                safe_rmtree(dest)
+            
+            # Try cloning without specifying branch
+            repo = git.Repo.clone_from(
+                url,
+                dest,
+                depth=1,
+                allow_unsafe_options=True,
+                env={'GIT_CONFIG_PARAMETERS': "'core.autocrlf=false' 'core.protectNTFS=false'"}
+            )
+            
+            # Then checkout the specific branch
+            try:
+                repo.git.checkout(branch, force=True)
+            except:
+                repo.git.checkout(f'origin/{branch}', force=True)
+            
+            return repo
 
 
 # ============================================================================
