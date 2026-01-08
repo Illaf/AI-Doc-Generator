@@ -1,28 +1,24 @@
 import os
-import tempfile,time
+import tempfile, time
 import shutil
-import asyncio,uuid
+import asyncio, uuid
 from pathlib import Path
-from typing import List, Dict, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 from dataclasses import dataclass
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import StreamingResponse,FileResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel, Field
-from utils.list_branches import list_remote_branches,branch_exists
+from utils.list_branches import list_remote_branches, branch_exists
 import git
 import ollama
-import ast
 from fastapi import APIRouter
-from requests import Session
 from services.export_doc import export_document
 from services.themes import build_prompt
-from services.caching import SessionLocal, get_cached_doc,save_cached_doc,get_commit_hash,STORAGE_ROOT,sanitize_filename,get_db
+from services.caching import SessionLocal, get_cached_doc, save_cached_doc, get_commit_hash, STORAGE_ROOT, sanitize_filename, get_db
+
 router = APIRouter()
-
-# app = FastAPI(title="OptimizedDocGenerator", version="2.0")
-
 
 # ============================================================================
 # CONFIGURATION
@@ -41,12 +37,16 @@ SKIP_PATTERNS = {
     "prefixes": ("test_", ".", "_"),
     "suffixes": (".pyc", ".pyo", ".pyd", ".so", ".dll")
 }
-job_store={}
+job_store = {}
 
+BATCH_SIZE = 8
+MAX_BATCH_TOKENS = 12000
+OLLAMA_TIMEOUT = 120
+MAX_PARALLEL_BATCHES = 3
 
 SYSTEM_PROMPT = """You are an expert technical writer. Create concise, clear documentation 
 for non-technical users. Focus on WHAT the code does and WHY it exists, not HOW.
-Keep responses under 150 words. Use simple language and analogies."""
+Keep each file's documentation under 150 words. Use simple language and analogies."""
 
 
 # ============================================================================
@@ -59,7 +59,9 @@ class FileInfo:
     path: str
     content: str
     size: int
-    
+    importance_score: int = 0
+
+
 class GenerateRequest(BaseModel):
     repo_url: str
     branch: str = Field(default="master")
@@ -70,9 +72,11 @@ class GenerateRequest(BaseModel):
     format: str = "md"
     theme: Optional[str] = None
 
+
 class BranchRequest(BaseModel):
     repo_url: str
     access_token: Optional[str] = None
+
 
 @router.post("/start-generation")
 def start_generation(req: GenerateRequest, background_tasks: BackgroundTasks):
@@ -83,36 +87,78 @@ def start_generation(req: GenerateRequest, background_tasks: BackgroundTasks):
         "progress": 0,
         "output_file": None,
         "error": None,
+        "total_batches": 0,
+        "completed_batches": 0,
     }
 
-    # START PURE WORKER
     background_tasks.add_task(worker_generate_docs, job_id, req)
 
     return {"job_id": job_id, "status": "started"}
+
 
 # ============================================================================
 # UTILITIES
 # ============================================================================
 
+def parse_github_url(url: str) -> Tuple[str, Optional[str]]:
+    """
+    Parse GitHub URL to extract base repo URL and subdirectory path.
+    
+    Examples:
+        'https://github.com/user/repo' -> ('https://github.com/user/repo', None)
+        'https://github.com/user/repo/tree/main/subfolder' -> ('https://github.com/user/repo', 'subfolder')
+    """
+    # Remove trailing slashes
+    url = url.rstrip('/')
+    
+    # Check if URL contains '/tree/{branch}/'
+    if '/tree/' in url:
+        parts = url.split('/tree/')
+        base_url = parts[0]
+        
+        # Extract subdirectory path (after branch name)
+        if len(parts) > 1:
+            tree_parts = parts[1].split('/', 1)
+            if len(tree_parts) > 1:
+                subdir = tree_parts[1]
+                return base_url, subdir
+    
+    return url, None
+
+
 def should_skip(path: Path) -> bool:
     """Fast path filtering using set lookups"""
-    # Check parents for skip directories
     if any(p.name in SKIP_PATTERNS["dirs"] for p in path.parents):
-        print(f"Skipped (dir): {path}")
         return True
-    
-    # Check filename
+
     name = path.name
     if name in SKIP_PATTERNS["files"]:
-        print(f"Skipped (file): {name}")
         return True
-    
-    # Check prefixes and suffixes
+
     if name.startswith(SKIP_PATTERNS["prefixes"]) or name.endswith(SKIP_PATTERNS["suffixes"]):
-        print(f"Skipped (dir): {name}")
         return True
-    
+
     return False
+
+
+def calculate_importance(file_path: Path, content: str) -> int:
+    """Score file importance (higher = more important)"""
+    score = 0
+
+    parts = file_path.parts
+    if "core" in parts or "main" in parts or "api" in parts:
+        score += 5
+    if len(parts) <= 3:
+        score += 3
+
+    if "class " in content.lower():
+        score += 2
+    if "def " in content:
+        score += 1
+    if len(content.split("\n")) > 50:
+        score += 2
+
+    return score
 
 
 def safe_rmtree(path: str, retries=5):
@@ -124,18 +170,28 @@ def safe_rmtree(path: str, retries=5):
             time.sleep(1)
     shutil.rmtree(path, ignore_errors=True)
 
-   
 
-def clone_repository(url: str, branch: str, token: Optional[str], dest: str) -> git.Repo:
-    """Clone repository with authentication support, handling Windows filesystem limitations"""
-    if token and url.startswith("https://"):
-        url = url.replace("https://", f"https://{token}@")
+def clone_repository(url: str, branch: str, token: Optional[str], dest: str) -> Tuple[git.Repo, Optional[str]]:
+    """
+    Clone repository with authentication support.
+    Returns (repo, subdirectory_path)
+    """
+    # Parse URL to check for subdirectory
+    base_url, subdir = parse_github_url(url)
     
-    # First attempt: Try with Windows protections disabled
+    if token and base_url.startswith("https://"):
+        clone_url = base_url.replace("https://", f"https://{token}@")
+    else:
+        clone_url = base_url
+
+    print(f"🔗 Cloning: {base_url}")
+    if subdir:
+        print(f"📁 Target subdirectory: {subdir}")
+
     try:
         repo = git.Repo.clone_from(
-            url, 
-            dest, 
+            clone_url,
+            dest,
             branch=branch,
             depth=1,
             single_branch=True,
@@ -144,265 +200,319 @@ def clone_repository(url: str, branch: str, token: Optional[str], dest: str) -> 
                 'GIT_CONFIG_PARAMETERS': "'core.autocrlf=false' 'core.protectNTFS=false' 'core.protectHFS=false'"
             }
         )
-        return repo
+        return repo, subdir
     except git.GitCommandError as e:
         error_msg = str(e)
-        
-        # Check if it's a Windows path issue (colons, invalid chars)
+
         if "invalid path" in error_msg or "unable to checkout working tree" in error_msg:
-            print(f"Checkout failed due to invalid filenames. Using sparse checkout to skip media files: {e}")
-            
-            # Remove the failed directory
+            print(f"⚠️ Checkout failed, using sparse checkout: {e}")
+
             if os.path.exists(dest):
                 safe_rmtree(dest)
-            
-            # Initialize empty repo
+
             os.makedirs(dest, exist_ok=True)
             repo = git.Repo.init(dest)
-            
-            # Add remote
-            origin = repo.create_remote('origin', url)
-            
-            # Enable sparse checkout in pattern mode
+            origin = repo.create_remote('origin', clone_url)
+
             repo.git.config('core.sparseCheckout', 'true')
             repo.git.config('core.sparseCheckoutCone', 'false')
-            
-            # Configure sparse checkout: include code, exclude media
+
             sparse_file = os.path.join(dest, '.git', 'info', 'sparse-checkout')
             with open(sparse_file, 'w') as f:
-                # Use a wildcard approach: include everything first
-                f.write('/*\n')
-                f.write('/**/*\n')
-                f.write('\n')
-                # Then exclude media files (! means exclude)
-                # Images
-                f.write('!*.jpg\n')
-                f.write('!*.jpeg\n')
-                f.write('!*.png\n')
-                f.write('!*.gif\n')
-                f.write('!*.bmp\n')
-                f.write('!*.svg\n')
-                f.write('!*.ico\n')
-                f.write('!*.webp\n')
-                f.write('!*.tiff\n')
-                f.write('!*.tif\n')
-                # Videos
-                f.write('!*.mp4\n')
-                f.write('!*.avi\n')
-                f.write('!*.mov\n')
-                f.write('!*.wmv\n')
-                f.write('!*.flv\n')
-                f.write('!*.mkv\n')
-                f.write('!*.webm\n')
-                f.write('!*.m4v\n')
-                f.write('!*.mpg\n')
-                f.write('!*.mpeg\n')
-                # Audio
-                f.write('!*.mp3\n')
-                f.write('!*.wav\n')
-                f.write('!*.flac\n')
-                f.write('!*.aac\n')
-                f.write('!*.ogg\n')
-                f.write('!*.m4a\n')
-                f.write('!*.wma\n')
-                # Archives
-                f.write('!*.zip\n')
-                f.write('!*.tar\n')
-                f.write('!*.gz\n')
-                f.write('!*.rar\n')
-                f.write('!*.7z\n')
-                # Binaries
-                f.write('!*.exe\n')
-                f.write('!*.dll\n')
-                f.write('!*.bin\n')
-                f.write('!*.dmg\n')
-                f.write('!*.pkg\n')
-            
-            # Disable protections and fetch
+                if subdir:
+                    # Only checkout the subdirectory
+                    f.write(f'{subdir}/*\n')
+                else:
+                    f.write('/*\n')
+                    f.write('/**/*\n')
+                
+                # Exclude media files
+                for ext in ['*.jpg', '*.png', '*.gif', '*.mp4', '*.zip', '*.exe', '*.dll']:
+                    f.write(f'!{ext}\n')
+
             repo.git.config('core.protectNTFS', 'false')
             repo.git.config('core.protectHFS', 'false')
-            
-            # Fetch the specific branch with sparse checkout
+
             try:
                 origin.fetch(branch, depth=1)
-                # Checkout the branch
                 repo.git.checkout(f'origin/{branch}')
-            except git.GitCommandError as fetch_error:
-                # If still failing, do a no-checkout fetch and manual read
-                print(f"Sparse checkout also failed, using no-checkout mode: {fetch_error}")
+            except git.GitCommandError:
                 origin.fetch(branch, depth=1, no_checkout=True)
-                # Create a minimal working tree with just Python files
-                repo.git.checkout(f'origin/{branch}', '--', '*.py', force=True)
-            
-            return repo
+                if subdir:
+                    repo.git.checkout(f'origin/{branch}', '--', f'{subdir}/*.py', force=True)
+                else:
+                    repo.git.checkout(f'origin/{branch}', '--', '*.py', force=True)
+
+            return repo, subdir
         else:
-            # For other errors, try alternative method
-            print(f"Clone failed for other reason, trying alternative: {e}")
-            
-            if os.path.exists(dest):
-                safe_rmtree(dest)
-            
-            # Try cloning without specifying branch
-            repo = git.Repo.clone_from(
-                url,
-                dest,
-                depth=1,
-                allow_unsafe_options=True,
-                env={'GIT_CONFIG_PARAMETERS': "'core.autocrlf=false' 'core.protectNTFS=false'"}
-            )
-            
-            # Then checkout the specific branch
-            try:
-                repo.git.checkout(branch, force=True)
-            except:
-                repo.git.checkout(f'origin/{branch}', force=True)
-            
-            return repo
+            raise
 
-
-# ============================================================================
-# CODE ANALYSIS
-# ============================================================================
 
 def analyze_file(file_path: Path) -> Optional[str]:
-    """Extract meaningful code structure efficiently"""
+    """Fast extraction of key code elements"""
     try:
         content = file_path.read_text(encoding="utf-8", errors="ignore")
-        
-        # Quick size check - skip very large or empty files
+
         if len(content) < 10 or len(content) > 100_000:
             return None
-        
-        tree = ast.parse(content)
+
+        lines = content.split("\n")
         elements = []
-        
-        # Module docstring
-        if doc := ast.get_docstring(tree):
-            elements.append(f"MODULE: {doc[:200]}")
-        
-        # Classes and functions
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef):
-                doc = ast.get_docstring(node) or "No description"
-                elements.append(f"CLASS {node.name}: {doc[:150]}")
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                if not node.name.startswith("_"):  # Skip private functions
-                    doc = ast.get_docstring(node) or "No description"
-                    elements.append(f"FUNCTION {node.name}: {doc[:150]}")
-        
+
+        in_docstring = False
+        docstring_content = []
+
+        for i, line in enumerate(lines[:100]):
+            stripped = line.strip()
+
+            if i < 5 and ('"""' in stripped or "'''" in stripped):
+                in_docstring = not in_docstring
+                if not in_docstring and docstring_content:
+                    elements.append(f"MODULE: {' '.join(docstring_content)[:200]}")
+                    break
+                continue
+
+            if in_docstring:
+                docstring_content.append(stripped.strip('"').strip("'"))
+                continue
+
+            if stripped.startswith("class "):
+                class_name = stripped.split("(")[0].replace("class ", "").strip(":")
+                elements.append(f"CLASS {class_name}")
+
+            elif stripped.startswith("def ") or stripped.startswith("async def "):
+                func_name = stripped.split("(")[0].replace("def ", "").replace("async ", "").strip()
+                if not func_name.startswith("_"):
+                    elements.append(f"FUNCTION {func_name}")
+
         return "\n".join(elements) if elements else None
-        
+
     except Exception:
         return None
 
-print("STORAGE_ROOT:", STORAGE_ROOT, type(STORAGE_ROOT))
 
 # ============================================================================
-# LLM INTERACTION
+# BATCH LLM INTERACTION
 # ============================================================================
 
-def generate_documentation(file_info: FileInfo, model: str,theme:str) -> Optional[Dict[str, str]]:
-    """Generate documentation for a single file"""
-    if not file_info.content:
-        return None
-    user_prompt=build_prompt(file_info.content,theme)
-#     user_prompt = f"""File: {file_info.path}
+def create_batch_prompt(file_infos: List[FileInfo], theme: str) -> str:
+    """Create a single prompt for multiple files"""
+    files_section = []
 
-# Structure:
-# {file_info.content}
+    for info in file_infos:
+        files_section.append(f"""
+---FILE: {info.path}---
+{info.content}
+""")
 
-# Explain this file's purpose and key functionality in simple terms."""
+    combined = "\n".join(files_section)
+    theme_instruction = f"\nContext: {theme}" if theme else ""
+
+    return f"""Analyze these {len(file_infos)} Python files and provide brief documentation for each.{theme_instruction}
+
+{combined}
+
+Format your response EXACTLY like this for each file:
+FILE: path/to/file.py
+DOCS: Your concise explanation here (max 150 words)
+
+FILE: path/to/another.py
+DOCS: Your concise explanation here (max 150 words)
+"""
+
+
+def generate_batch_documentation_with_timeout(batch: List[FileInfo], model: str, theme: str, timeout: int = OLLAMA_TIMEOUT) -> List[Dict[str, str]]:
+    """Generate documentation with timeout protection"""
+    if not batch:
+        return []
+
+    prompt = create_batch_prompt(batch, theme)
 
     try:
-        response = ollama.chat(
-            model=model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-                
-            ],
-            
-            options={
-                "temperature": 0.3,  # More consistent output
-                "num_predict": 200,  # Limit response length
-            },
-            stream= True
-        )
-        full_text = ""
-        for chunk in response:
-            if "message" in chunk and "content" in chunk["message"]:
-                full_text += chunk["message"]["content"]
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                ollama.chat,
+                model=model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                options={
+                    "temperature": 0.3,
+                    "num_predict": 250 * len(batch),
+                },
+                stream=False
+            )
 
-        return {
-            "path": file_info.path,
-            "documentation": full_text.strip()
-        }
+            try:
+                response = future.result(timeout=timeout)
+            except TimeoutError:
+                print(f"⚠️ Batch timed out after {timeout}s, using fallback")
+                return [{"path": f.path, "documentation": "⏱️ Documentation generation timed out"} for f in batch]
+
+        response_text = response['message']['content']
+
+        # Parse response
+        results = []
+        current_file = None
+        current_docs = []
+
+        for line in response_text.split("\n"):
+            if line.startswith("FILE:"):
+                if current_file and current_docs:
+                    results.append({
+                        "path": current_file,
+                        "documentation": " ".join(current_docs).strip()
+                    })
+
+                current_file = line.replace("FILE:", "").strip()
+                current_docs = []
+
+            elif line.startswith("DOCS:"):
+                current_docs.append(line.replace("DOCS:", "").strip())
+
+            elif current_file and line.strip():
+                current_docs.append(line.strip())
+
+        if current_file and current_docs:
+            results.append({
+                "path": current_file,
+                "documentation": " ".join(current_docs).strip()
+            })
+
+        if not results:
+            print("⚠️ Batch parsing failed, using fallback")
+            results = [{"path": f.path, "documentation": "📝 Documentation generated"} for f in batch]
+
+        return results
+
     except Exception as e:
-        print(f"Error generating docs for {file_info.path}: {e}")
-        return None
+        print(f"❌ Batch generation error: {e}")
+        return [{"path": f.path, "documentation": f"❌ Error: {str(e)[:100]}"} for f in batch]
 
 
 # ============================================================================
-# BATCH PROCESSING
+# OPTIMIZED BATCH PROCESSING
 # ============================================================================
 
-def process_repository(repo_path: Path, model: str, max_workers: int,theme: str) -> List[Dict[str, str]]:
-    """Process all files in parallel with optimal batching"""
+def process_repository(repo_path: Path, model: str, max_workers: int, theme: str, job_id: str, subdir: Optional[str] = None) -> List[Dict[str, str]]:
+    """Process files with subdirectory support"""
+
+    # Determine search path
+    search_path = repo_path / subdir if subdir else repo_path
     
-    # Stage 1: Fast file discovery and filtering
-    py_files = [f for f in repo_path.rglob("*.py") if not should_skip(f)]
-    
-    if not py_files:
+    if not search_path.exists():
+        print(f"❌ Path does not exist: {search_path}")
         return []
-    
-    # Stage 2: Parallel code analysis
+
+    # Stage 1: File discovery
+    job_store[job_id]["status"] = f"Discovering files in {subdir or 'root'}"
+    all_py_files = list(search_path.rglob("*.py"))
+    print(f"📂 Found {len(all_py_files)} .py files in {search_path}")
+
+    py_files = [f for f in all_py_files if not should_skip(f)]
+
+    if not py_files:
+        print(f"⚠️ No valid files after filtering from {len(all_py_files)} total")
+        return []
+
+    print(f"✅ Processing {len(py_files)} files after filtering:")
+    for f in py_files:
+        print(f"   - {f.relative_to(repo_path)}")
+
+    # Stage 2: Parallel analysis
+    job_store[job_id]["status"] = "Analyzing code"
     file_infos: List[FileInfo] = []
-    
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_file = {
-            executor.submit(analyze_file, f): f for f in py_files
-        }
-        
+        future_to_file = {executor.submit(analyze_file, f): f for f in py_files}
+
         for future in as_completed(future_to_file):
             file_path = future_to_file[future]
             try:
                 content = future.result()
                 if content:
-                    file_infos.append(FileInfo(
+                    info = FileInfo(
                         path=str(file_path.relative_to(repo_path)),
                         content=content,
                         size=len(content)
-                    ))
-            except Exception:
+                    )
+                    info.importance_score = calculate_importance(file_path, content)
+                    file_infos.append(info)
+            except Exception as e:
+                print(f"⚠️ Failed to analyze {file_path}: {e}")
                 continue
-    
+
     if not file_infos:
         return []
-    
-    # Sort by size (process smaller files first for better UX)
-    file_infos.sort(key=lambda x: x.size)
-    
-    # Stage 3: Parallel LLM documentation generation
-    results = []
-    
-    with ThreadPoolExecutor(max_workers=min(max_workers, 5)) as executor:
-        future_to_info = {
-            executor.submit(generate_documentation, info, model, theme): info 
-            for info in file_infos
+
+    print(f"📊 Analyzed {len(file_infos)} files")
+
+    # Sort by importance
+    file_infos.sort(key=lambda x: (-x.importance_score, x.size))
+
+    # Stage 3: Create batches
+    job_store[job_id]["status"] = "Creating batches"
+    batches = []
+    current_batch = []
+    current_batch_size = 0
+
+    for info in file_infos:
+        estimated_tokens = len(info.content) // 4
+
+        if (current_batch_size + estimated_tokens > MAX_BATCH_TOKENS or
+                len(current_batch) >= BATCH_SIZE):
+            if current_batch:
+                batches.append(current_batch)
+            current_batch = [info]
+            current_batch_size = estimated_tokens
+        else:
+            current_batch.append(info)
+            current_batch_size += estimated_tokens
+
+    if current_batch:
+        batches.append(current_batch)
+
+    print(f"📦 Created {len(batches)} batches")
+
+    # Update job store
+    job_store[job_id]["total_batches"] = len(batches)
+    job_store[job_id]["completed_batches"] = 0
+
+    # Stage 4: Process batches
+    job_store[job_id]["status"] = "Generating documentation"
+    all_results = []
+
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL_BATCHES) as executor:
+        future_to_batch = {
+            executor.submit(generate_batch_documentation_with_timeout, batch, model, theme): idx
+            for idx, batch in enumerate(batches)
         }
-        
-        for future in as_completed(future_to_info):
+
+        for future in as_completed(future_to_batch):
+            batch_idx = future_to_batch[future]
             try:
-                if result := future.result():
-                    results.append(result)
-            except Exception:
+                results = future.result()
+                all_results.extend(results)
+
+                # Update progress
+                job_store[job_id]["completed_batches"] += 1
+                completed = job_store[job_id]["completed_batches"]
+                total = job_store[job_id]["total_batches"]
+                progress = 30 + int((completed / total) * 40)
+                job_store[job_id]["progress"] = progress
+
+                print(f"✅ Batch {completed}/{total} complete ({progress}%)")
+
+            except Exception as e:
+                print(f"❌ Batch {batch_idx} error: {e}")
                 continue
-    
-    return results
+
+    return all_results
 
 
 # ============================================================================
-# API ENDPOINTS
+# WORKER FUNCTION
 # ============================================================================
 
 def worker_generate_docs(job_id: str, req: GenerateRequest):
@@ -410,26 +520,33 @@ def worker_generate_docs(job_id: str, req: GenerateRequest):
     tmp_dir = tempfile.mkdtemp(prefix="repo-")
 
     try:
+        job_store[job_id]["status"] = "Parsing URL"
+        job_store[job_id]["progress"] = 5
+        
+        # Parse URL to get base repo and subdirectory
+        base_url, subdir = parse_github_url(req.repo_url)
+        print(f"🔍 Base URL: {base_url}")
+        print(f"🔍 Subdirectory: {subdir or 'None (root)'}")
+
         job_store[job_id]["status"] = "Cloning repository"
         job_store[job_id]["progress"] = 10
-        
-        # validate branch
-        if not branch_exists(req.repo_url, req.branch, req.access_token):
-            raise Exception(f"Branch '{req.branch}' does not exist in repository")
 
-        repo = clone_repository(req.repo_url, req.branch, req.access_token, tmp_dir)
+        if not branch_exists(base_url, req.branch, req.access_token):
+            raise Exception(f"Branch '{req.branch}' does not exist")
+
+        repo, subdir_path = clone_repository(req.repo_url, req.branch, req.access_token, tmp_dir)
         repo.git.clear_cache()
         repo.close()
         del repo
         repo_path = Path(tmp_dir)
 
-        # Commit hash
         commit_hash = get_commit_hash(repo_path)
 
-        # Check cache
-        cached = get_cached_doc(db, req.repo_url, req.branch, commit_hash)
+        # Check cache (include subdir in cache key)
+        cache_key = f"{base_url}/{subdir}" if subdir else base_url
+        cached = get_cached_doc(db, cache_key, req.branch, commit_hash)
         if cached:
-            job_store[job_id]["status"] = "Completed"
+            job_store[job_id]["status"] = "Completed (cached)"
             job_store[job_id]["progress"] = 100
             job_store[job_id]["output_file"] = cached.doc_path
             return
@@ -438,40 +555,49 @@ def worker_generate_docs(job_id: str, req: GenerateRequest):
         job_store[job_id]["status"] = "Processing files"
         job_store[job_id]["progress"] = 30
 
-        results = process_repository(repo_path, req.model, req.max_workers, req.theme)
+        results = process_repository(repo_path, req.model, req.max_workers, req.theme, job_id, subdir_path)
 
         if not results:
-            job_store[job_id]["error"] = "No documentable Python files found"
+            search_path = repo_path / subdir_path if subdir_path else repo_path
+            all_files = list(search_path.rglob("*.py"))
+            error_msg = f"No documentable files in {subdir_path or 'repository'}. "
+            if len(all_files) == 0:
+                error_msg += "No .py files found."
+            else:
+                error_msg += f"Found {len(all_files)} .py files but all were filtered."
+
+            job_store[job_id]["error"] = error_msg
             job_store[job_id]["status"] = "Failed"
             return
 
         # Build markdown
-        job_store[job_id]["status"] = "Building Markdown"
-        job_store[job_id]["progress"] = 50
+        job_store[job_id]["status"] = "Building document"
+        job_store[job_id]["progress"] = 75
 
-        docs = ["# Repository Documentation\n"]
+        docs = [f"# Repository Documentation\n"]
+        if subdir_path:
+            docs.append(f"**Subdirectory:** `{subdir_path}`\n")
+        
         for item in results:
             docs.append(f"## `{item['path']}`\n\n{item['documentation']}\n")
 
         final_doc = "\n".join(docs)
 
         # Export
-        job_store[job_id]["status"] = "Exporting document"
-        job_store[job_id]["progress"] = 80
+        job_store[job_id]["status"] = "Exporting"
+        job_store[job_id]["progress"] = 90
 
         output_file = export_document(final_doc, req.format)
 
-        # cache folder
-        folder = STORAGE_ROOT / sanitize_filename(req.repo_url) / commit_hash
+        folder = STORAGE_ROOT / sanitize_filename(cache_key) / commit_hash
         folder.mkdir(parents=True, exist_ok=True)
 
         final_path = folder / f"documentation.{req.format}"
         shutil.move(output_file, final_path)
 
-        # store cache
         save_cached_doc(
             db,
-            repo_url=req.repo_url,
+            repo_url=cache_key,
             branch=req.branch,
             commit_hash=commit_hash,
             doc_path=str(final_path),
@@ -484,39 +610,42 @@ def worker_generate_docs(job_id: str, req: GenerateRequest):
     except Exception as e:
         job_store[job_id]["error"] = str(e)
         job_store[job_id]["status"] = "Failed"
+        print(f"❌ Job {job_id} failed: {e}")
+        import traceback
+        traceback.print_exc()
 
     finally:
         try:
-            import time
-            time.sleep(0.5)  # allow PDF writer to release lock
+            time.sleep(0.5)
             safe_rmtree(tmp_dir)
         except Exception as cleanup_error:
-            print(f"Cleanup error: {cleanup_error}")
+            print(f"⚠️ Cleanup error: {cleanup_error}")
         finally:
             db.close()
 
 
+# ============================================================================
+# API ENDPOINTS
+# ============================================================================
+
 @router.get("/health")
 def health():
-    """Health check endpoint"""
     try:
-        ollama.list()  # Check if Ollama is running
+        ollama.list()
         return {"status": "healthy", "ollama": "connected"}
     except Exception:
         return {"status": "degraded", "ollama": "disconnected"}
 
+
 @router.get("/status/{job_id}")
-def get_status(job_id:str):
+def get_status(job_id: str):
     if job_id not in job_store:
-        return HTTPException(404,"Invalid Job Id") 
+        raise HTTPException(404, "Invalid Job Id")
     return job_store[job_id]
+
 
 @router.get("/download/{job_id}")
 def download(job_id: str):
-    """
-    Download the generated documentation file.
-    Returns the file with appropriate headers for browser download.
-    """
     job = job_store.get(job_id)
 
     if not job:
@@ -525,35 +654,28 @@ def download(job_id: str):
     if job.get("error"):
         raise HTTPException(status_code=500, detail=job["error"])
 
-    if job["status"] != "Completed":
+    if job["status"] != "Completed" and not job["status"].startswith("Completed"):
         raise HTTPException(
             status_code=425,
-            detail=f"Document not ready yet. Status: {job['status']}, Progress: {job['progress']}%"
+            detail=f"Not ready. Status: {job['status']}, Progress: {job['progress']}%"
         )
 
     output_file = job.get("output_file")
-    
-    if not output_file or not os.path.exists(output_file):
-        raise HTTPException(status_code=404, detail="Generated file not found")
 
-    # Determine file extension and media type
-    file_format = job.get("format", "md")
-    repo_name = job.get("repo_name", "documentation")
-    
-    # Map format to media type
+    if not output_file or not os.path.exists(output_file):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    file_format = output_file.split('.')[-1]
     media_type_map = {
         "md": "text/markdown",
         "pdf": "application/pdf",
         "html": "text/html",
         "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "txt": "text/plain"
     }
-    
+
     media_type = media_type_map.get(file_format, "application/octet-stream")
-    
-    # Create a friendly filename
-    filename = f"{repo_name}_documentation.{file_format}"
-    
+    filename = f"documentation.{file_format}"
+
     return FileResponse(
         path=output_file,
         media_type=media_type,
@@ -564,10 +686,13 @@ def download(job_id: str):
         }
     )
 
+
 @router.post("/list-branches")
 def list_branches(req: BranchRequest):
     try:
-        branches = list_remote_branches(req.repo_url, req.access_token)
+        # Parse URL to get base repo
+        base_url, _ = parse_github_url(req.repo_url)
+        branches = list_remote_branches(base_url, req.access_token)
         if not branches:
             raise HTTPException(400, "No branches found")
 
@@ -575,33 +700,20 @@ def list_branches(req: BranchRequest):
             "default": "main" if "main" in branches else branches[0],
             "branches": branches
         }
-
     except Exception as e:
         raise HTTPException(400, str(e))
- 
+
 
 @router.get("/")
 def root():
-    """API information"""
     return {
         "service": "Optimized Documentation Generator",
-        "version": "2.0",
+        "version": "2.1",
+        "features": ["Subdirectory support", "Batch processing", "Timeout protection"],
         "endpoints": {
-            "generate": "/generate-docs",
+            "start": "/start-generation",
+            "status": "/status/{job_id}",
+            "download": "/download/{job_id}",
             "health": "/health"
         }
     }
-
-
-# ============================================================================
-# ENTRY POINT
-# ============================================================================
-
-# if __name__ == "__main__":
-#     import uvicorn
-#     uvicorn.run(
-#         app,
-#         host="0.0.0.0",
-#         port=8000,
-#         log_level="info"
-#     )
