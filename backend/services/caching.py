@@ -97,6 +97,7 @@ def save_final_doc_to_stoage(final_doc:str,repo_url:str,commit_hash:str,fmt:str 
     return str(outpath)
 
 def get_cached_doc(db_session,repo_url:str,branch:str,commit_hash:str):
+    
     return db_session.query(RepoCache).filter(RepoCache.repo_url== repo_url).filter(RepoCache.branch == branch).filter(RepoCache.commit_hash == commit_hash).first()
 
 # ---------- DB helpers ----------

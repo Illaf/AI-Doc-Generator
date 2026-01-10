@@ -1,10 +1,11 @@
 import os
 import tempfile, time
 import shutil
+import urllib.parse
 import asyncio, uuid
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, BackgroundTasks
@@ -41,7 +42,6 @@ job_store = {}
 
 BATCH_SIZE = 8
 MAX_BATCH_TOKENS = 12000
-OLLAMA_TIMEOUT = 120
 MAX_PARALLEL_BATCHES = 3
 
 SYSTEM_PROMPT = """You are an expert technical writer. Create concise, clear documentation 
@@ -71,6 +71,7 @@ class GenerateRequest(BaseModel):
     stream: bool = False
     format: str = "md"
     theme: Optional[str] = None
+    use_cache: bool = Field(default=True, description="Use cached documentation if available")
 
 
 class BranchRequest(BaseModel):
@@ -81,7 +82,7 @@ class BranchRequest(BaseModel):
 @router.post("/start-generation")
 def start_generation(req: GenerateRequest, background_tasks: BackgroundTasks):
     job_id = uuid.uuid4().hex
-
+    print("use_cache =", req.use_cache)
     job_store[job_id] = {
         "status": "queued",
         "progress": 0,
@@ -106,10 +107,16 @@ def parse_github_url(url: str) -> Tuple[str, Optional[str]]:
     
     Examples:
         'https://github.com/user/repo' -> ('https://github.com/user/repo', None)
+        'https://github.com/user/repo.git' -> ('https://github.com/user/repo', None)
         'https://github.com/user/repo/tree/main/subfolder' -> ('https://github.com/user/repo', 'subfolder')
+        'https://github.com/user/repo/tree/main/Address%20Validator' -> ('https://github.com/user/repo', 'Address Validator')
     """
-    # Remove trailing slashes
+    # Remove trailing slashes and .git suffix
     url = url.rstrip('/')
+    if url.endswith('.git'):
+        url = url[:-4]
+    
+    print(f"🔍 Parsing URL: {url}")
     
     # Check if URL contains '/tree/{branch}/'
     if '/tree/' in url:
@@ -120,9 +127,12 @@ def parse_github_url(url: str) -> Tuple[str, Optional[str]]:
         if len(parts) > 1:
             tree_parts = parts[1].split('/', 1)
             if len(tree_parts) > 1:
-                subdir = tree_parts[1]
+                # URL decode the subdirectory name (handles %20 etc.)
+                subdir = urllib.parse.unquote(tree_parts[1])
+                print(f"✅ Extracted - Base: {base_url}, Subdir: {subdir}")
                 return base_url, subdir
     
+    print(f"✅ No subdirectory found - Base: {url}")
     return url, None
 
 
@@ -173,10 +183,9 @@ def safe_rmtree(path: str, retries=5):
 
 def clone_repository(url: str, branch: str, token: Optional[str], dest: str) -> Tuple[git.Repo, Optional[str]]:
     """
-    Clone repository with authentication support.
+    Clone repository with sparse checkout for subdirectories.
     Returns (repo, subdirectory_path)
     """
-    # Parse URL to check for subdirectory
     base_url, subdir = parse_github_url(url)
     
     if token and base_url.startswith("https://"):
@@ -184,68 +193,70 @@ def clone_repository(url: str, branch: str, token: Optional[str], dest: str) -> 
     else:
         clone_url = base_url
 
-    print(f"🔗 Cloning: {base_url}")
+    print(f"🔗 Base URL: {base_url}")
     if subdir:
-        print(f"📁 Target subdirectory: {subdir}")
+        print(f"📁 Subdirectory: {subdir}")
 
+    # Always use sparse checkout approach for better control
+    if os.path.exists(dest):
+        safe_rmtree(dest)
+    
+    os.makedirs(dest, exist_ok=True)
+    
     try:
-        repo = git.Repo.clone_from(
-            clone_url,
-            dest,
-            branch=branch,
-            depth=1,
-            single_branch=True,
-            allow_unsafe_options=True,
-            env={
-                'GIT_CONFIG_PARAMETERS': "'core.autocrlf=false' 'core.protectNTFS=false' 'core.protectHFS=false'"
-            }
-        )
-        return repo, subdir
-    except git.GitCommandError as e:
-        error_msg = str(e)
-
-        if "invalid path" in error_msg or "unable to checkout working tree" in error_msg:
-            print(f"⚠️ Checkout failed, using sparse checkout: {e}")
-
-            if os.path.exists(dest):
-                safe_rmtree(dest)
-
-            os.makedirs(dest, exist_ok=True)
-            repo = git.Repo.init(dest)
-            origin = repo.create_remote('origin', clone_url)
-
+        # Initialize repo
+        repo = git.Repo.init(dest)
+        origin = repo.create_remote('origin', clone_url)
+        
+        # Configure Git settings
+        repo.git.config('core.protectNTFS', 'false')
+        repo.git.config('core.protectHFS', 'false')
+        repo.git.config('core.autocrlf', 'false')
+        
+        if subdir:
+            # Enable sparse checkout
             repo.git.config('core.sparseCheckout', 'true')
             repo.git.config('core.sparseCheckoutCone', 'false')
-
+            
+            # Create sparse-checkout file
             sparse_file = os.path.join(dest, '.git', 'info', 'sparse-checkout')
+            os.makedirs(os.path.dirname(sparse_file), exist_ok=True)
+            
             with open(sparse_file, 'w') as f:
-                if subdir:
-                    # Only checkout the subdirectory
-                    f.write(f'{subdir}/*\n')
-                else:
-                    f.write('/*\n')
-                    f.write('/**/*\n')
-                
+                # Only checkout the subdirectory
+                f.write(f'{subdir}/\n')
                 # Exclude media files
-                for ext in ['*.jpg', '*.png', '*.gif', '*.mp4', '*.zip', '*.exe', '*.dll']:
-                    f.write(f'!{ext}\n')
-
-            repo.git.config('core.protectNTFS', 'false')
-            repo.git.config('core.protectHFS', 'false')
-
-            try:
-                origin.fetch(branch, depth=1)
-                repo.git.checkout(f'origin/{branch}')
-            except git.GitCommandError:
-                origin.fetch(branch, depth=1, no_checkout=True)
-                if subdir:
-                    repo.git.checkout(f'origin/{branch}', '--', f'{subdir}/*.py', force=True)
-                else:
-                    repo.git.checkout(f'origin/{branch}', '--', '*.py', force=True)
-
-            return repo, subdir
-        else:
-            raise
+                f.write('!*.jpg\n')
+                f.write('!*.png\n')
+                f.write('!*.gif\n')
+                f.write('!*.mp4\n')
+                f.write('!*.zip\n')
+            
+            print(f"⚙️ Sparse checkout configured for: {subdir}")
+        
+        # Fetch the branch
+        print(f"📥 Fetching branch: {branch}")
+        origin.fetch(branch, depth=1)
+        
+        # Checkout
+        print(f"✅ Checking out files")
+        repo.git.checkout(f'origin/{branch}')
+        
+        # Verify the subdirectory exists in working tree
+        if subdir:
+            subdir_path = Path(dest) / subdir
+            if not subdir_path.exists():
+                raise Exception(f"Subdirectory '{subdir}' not found after checkout")
+            print(f"✅ Subdirectory verified: {subdir_path}")
+        
+        return repo, subdir
+        
+    except Exception as e:
+        print(f"❌ Clone error: {e}")
+        # Cleanup on failure
+        if os.path.exists(dest):
+            safe_rmtree(dest)
+        raise
 
 
 def analyze_file(file_path: Path) -> Optional[str]:
@@ -321,34 +332,26 @@ DOCS: Your concise explanation here (max 150 words)
 """
 
 
-def generate_batch_documentation_with_timeout(batch: List[FileInfo], model: str, theme: str, timeout: int = OLLAMA_TIMEOUT) -> List[Dict[str, str]]:
-    """Generate documentation with timeout protection"""
+def generate_batch_documentation(batch: List[FileInfo], model: str, theme: str) -> List[Dict[str, str]]:
+    """Generate documentation for a batch of files"""
     if not batch:
         return []
 
     prompt = create_batch_prompt(batch, theme)
 
     try:
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(
-                ollama.chat,
-                model=model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                options={
-                    "temperature": 0.3,
-                    "num_predict": 250 * len(batch),
-                },
-                stream=False
-            )
-
-            try:
-                response = future.result(timeout=timeout)
-            except TimeoutError:
-                print(f"⚠️ Batch timed out after {timeout}s, using fallback")
-                return [{"path": f.path, "documentation": "⏱️ Documentation generation timed out"} for f in batch]
+        response = ollama.chat(
+            model=model,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            options={
+                "temperature": 0.3,
+                "num_predict": 250 * len(batch),
+            },
+            stream=False
+        )
 
         response_text = response['message']['content']
 
@@ -399,17 +402,22 @@ def process_repository(repo_path: Path, model: str, max_workers: int, theme: str
     """Process files with subdirectory support"""
 
     # Determine search path
-    search_path = repo_path / subdir if subdir else repo_path
+    if subdir:
+        search_path = repo_path / subdir
+        print(f"🔍 Searching only in subdirectory: {search_path}")
+    else:
+        search_path = repo_path
+        print(f"🔍 Searching entire repository: {search_path}")
     
     if not search_path.exists():
-        print(f"❌ Path does not exist: {search_path}")
-        return []
+        raise Exception(f"Path does not exist: {search_path}")
 
     # Stage 1: File discovery
     job_store[job_id]["status"] = f"Discovering files in {subdir or 'root'}"
     all_py_files = list(search_path.rglob("*.py"))
     print(f"📂 Found {len(all_py_files)} .py files in {search_path}")
 
+    # Filter files
     py_files = [f for f in all_py_files if not should_skip(f)]
 
     if not py_files:
@@ -417,8 +425,10 @@ def process_repository(repo_path: Path, model: str, max_workers: int, theme: str
         return []
 
     print(f"✅ Processing {len(py_files)} files after filtering:")
-    for f in py_files:
+    for f in py_files[:10]:  # Show first 10
         print(f"   - {f.relative_to(repo_path)}")
+    if len(py_files) > 10:
+        print(f"   ... and {len(py_files) - 10} more")
 
     # Stage 2: Parallel analysis
     job_store[job_id]["status"] = "Analyzing code"
@@ -446,7 +456,7 @@ def process_repository(repo_path: Path, model: str, max_workers: int, theme: str
     if not file_infos:
         return []
 
-    print(f"📊 Analyzed {len(file_infos)} files")
+    print(f"📊 Analyzed {len(file_infos)} files successfully")
 
     # Sort by importance
     file_infos.sort(key=lambda x: (-x.importance_score, x.size))
@@ -485,7 +495,7 @@ def process_repository(repo_path: Path, model: str, max_workers: int, theme: str
 
     with ThreadPoolExecutor(max_workers=MAX_PARALLEL_BATCHES) as executor:
         future_to_batch = {
-            executor.submit(generate_batch_documentation_with_timeout, batch, model, theme): idx
+            executor.submit(generate_batch_documentation, batch, model, theme): idx
             for idx, batch in enumerate(batches)
         }
 
@@ -544,12 +554,22 @@ def worker_generate_docs(job_id: str, req: GenerateRequest):
 
         # Check cache (include subdir in cache key)
         cache_key = f"{base_url}/{subdir}" if subdir else base_url
-        cached = get_cached_doc(db, cache_key, req.branch, commit_hash)
-        if cached:
-            job_store[job_id]["status"] = "Completed (cached)"
-            job_store[job_id]["progress"] = 100
-            job_store[job_id]["output_file"] = cached.doc_path
+        
+
+        if req.use_cache:
+            print("use_cache =", req.use_cache)
+            cached = get_cached_doc(db, cache_key, req.branch, commit_hash)
+            if cached:
+                job_store[job_id].update({
+            "status": "Completed",
+            "cached": True,
+            "progress": 100,
+            "output_file": cached.doc_path
+            })
+            print(f"✅ Using cached documentation from {cached.doc_path}")
             return
+        else:
+            print(f"🔄 Cache bypassed - generating fresh documentation")
 
         # Process files
         job_store[job_id]["status"] = "Processing files"
@@ -595,17 +615,26 @@ def worker_generate_docs(job_id: str, req: GenerateRequest):
         final_path = folder / f"documentation.{req.format}"
         shutil.move(output_file, final_path)
 
-        save_cached_doc(
-            db,
-            repo_url=cache_key,
-            branch=req.branch,
-            commit_hash=commit_hash,
-            doc_path=str(final_path),
-        )
+        # Save to cache only if cache is enabled
+        if req.use_cache:
+            save_cached_doc(
+                db,
+                repo_url=cache_key,
+                branch=req.branch,
+                commit_hash=commit_hash,
+                doc_path=str(final_path),
+            )
+            print(f"💾 Documentation cached at {final_path}")
+        else:
+            print(f"💾 Documentation saved (not cached) at {final_path}")
 
-        job_store[job_id]["status"] = "Completed"
-        job_store[job_id]["progress"] = 100
-        job_store[job_id]["output_file"] = str(final_path)
+        job_store[job_id].update({
+    "status": "Completed",
+    "cached": False,
+    "progress": 100,
+    "output_file": str(final_path)
+    })
+
 
     except Exception as e:
         job_store[job_id]["error"] = str(e)
@@ -709,7 +738,7 @@ def root():
     return {
         "service": "Optimized Documentation Generator",
         "version": "2.1",
-        "features": ["Subdirectory support", "Batch processing", "Timeout protection"],
+        "features": ["Subdirectory support", "Batch processing"],
         "endpoints": {
             "start": "/start-generation",
             "status": "/status/{job_id}",

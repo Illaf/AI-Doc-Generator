@@ -12,6 +12,7 @@ export default function GenerateDocsPage() {
   const [theme, setTheme] = useState("default");
   const [model, setModel] = useState("llama3.2");
   const [format, setFormat] = useState("md");
+  const [useCache, setUseCache] = useState(true);
   const [loading, setLoading] = useState(false);
   const [jobId, setJobId] = useState<string | null>(null);
   const [status, setStatus] = useState("");
@@ -20,7 +21,8 @@ export default function GenerateDocsPage() {
   const [branchList,setBranchList] = useState<string[]>([])
   const [selectedBranch, setSelectedBranch] = useState<string>("");
   const [loadingBranches, setLoadingBranches] = useState(false);
- 
+  const [wasCached, setWasCached] = useState<boolean | null>(null);
+
   async function startGeneration() {
     if (!repo) return;
     
@@ -38,6 +40,7 @@ export default function GenerateDocsPage() {
         theme,
         model,
         format,
+        use_cache: useCache,
       }),
     });
   
@@ -89,7 +92,7 @@ export default function GenerateDocsPage() {
       setStatus(data.status);
       setProgress(data.progress || 0);
   
-      if (data.status === "Completed" || data.status === "Loaded from cache") {
+      if (data.progress === 100 && data.output_file) {
         setDownloadReady(true);
         clearInterval(interval);
       }
@@ -148,6 +151,33 @@ export default function GenerateDocsPage() {
                   ))}
                 </select>
               )}
+            </div>
+
+            {/* Cache Control */}
+            <div className="bg-gray-50 rounded-lg p-4 border border-gray-200">
+              <div className="flex items-start space-x-3">
+                <input
+                  type="checkbox"
+                  id="useCache"
+                  checked={useCache}
+                  onChange={(e) => setUseCache(e.target.checked)}
+                  className="mt-1 h-4 w-4 text-gray-900 rounded border-gray-300
+                             focus:ring-2 focus:ring-gray-900"
+                />
+                <div className="flex-1">
+                  <label 
+                    htmlFor="useCache" 
+                    className="block text-sm font-medium text-gray-700 cursor-pointer"
+                  >
+                    Use cached documentation
+                  </label>
+                  <p className="text-xs text-gray-500 mt-1">
+                    {useCache 
+                      ? "Will use existing documentation if available for this commit. Faster generation." 
+                      : "Will generate fresh documentation, ignoring cache. Takes longer but ensures latest analysis."}
+                  </p>
+                </div>
+              </div>
             </div>
   
             {/* Theme */}
