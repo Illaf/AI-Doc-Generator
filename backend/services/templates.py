@@ -1,5 +1,5 @@
 # services/templates.py
-
+import markdown
 TEMPLATES = {
     "minimal": """
 <!DOCTYPE html>
@@ -510,20 +510,18 @@ TEMPLATES = {
 }
 
 
-def apply_template(markdown_content: str, template_name: str = "minimal") -> str:
+def apply_template(markdown_content: str, template_name: str ) -> str:
     """
     Convert markdown to HTML and apply selected template
     """
-    import markdown
-    
-    # Convert markdown to HTML
+    print("🎨 Using template:", template_name)
+
     html_content = markdown.markdown(
         markdown_content,
-        extensions=['fenced_code', 'codehilite', 'tables']
+        extensions=["fenced_code", "codehilite", "tables"]
     )
-    
-    # Get template
+
     template = TEMPLATES.get(template_name, TEMPLATES["minimal"])
-    
-    # Apply template
-    return template.format(content=html_content)
+
+    # 🚀 SAFE replacement (no format())
+    return template.replace("{content}", html_content)

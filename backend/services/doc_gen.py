@@ -42,7 +42,7 @@ job_store = {}
 
 BATCH_SIZE = 8
 MAX_BATCH_TOKENS = 12000
-MAX_PARALLEL_BATCHES = 3
+MAX_PARALLEL_BATCHES = 2
 
 SYSTEM_PROMPT = """You are an expert technical writer. Create concise, clear documentation 
 for non-technical users. Focus on WHAT the code does and WHY it exists, not HOW.
@@ -67,11 +67,12 @@ class GenerateRequest(BaseModel):
     branch: str = Field(default="master")
     access_token: Optional[str] = None
     model: str = "llama3.2"
-    max_workers: int = 10
+    max_workers: int = 2
     stream: bool = False
     format: str = "md"
     theme: Optional[str] = None
     use_cache: bool = Field(default=True, description="Use cached documentation if available")
+    template: str = Field(default="minimal", description="UI template for HTML/PDF output") 
 
 
 class BranchRequest(BaseModel):
@@ -353,45 +354,63 @@ def generate_batch_documentation(batch: List[FileInfo], model: str, theme: str) 
             stream=False
         )
 
-        response_text = response['message']['content']
+        response_text = response["message"]["content"]
 
-        # Parse response
+        # ---------- FLEXIBLE PARSER (Option 2) ----------
         results = []
         current_file = None
         current_docs = []
 
-        for line in response_text.split("\n"):
-            if line.startswith("FILE:"):
+        for line in response_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+
+            # Match: FILE: path OR markdown headers ## path / ### path
+            if line.startswith("FILE:") or line.startswith("##"):
+                # Save previous file
                 if current_file and current_docs:
                     results.append({
                         "path": current_file,
-                        "documentation": " ".join(current_docs).strip()
+                        "documentation": "\n".join(current_docs).strip()
                     })
 
-                current_file = line.replace("FILE:", "").strip()
+                current_file = (
+                    line.replace("FILE:", "")
+                        .lstrip("#")
+                        .strip()
+                )
                 current_docs = []
 
-            elif line.startswith("DOCS:"):
-                current_docs.append(line.replace("DOCS:", "").strip())
+            else:
+                if current_file:
+                    current_docs.append(line)
 
-            elif current_file and line.strip():
-                current_docs.append(line.strip())
-
+        # Save last file
         if current_file and current_docs:
             results.append({
                 "path": current_file,
-                "documentation": " ".join(current_docs).strip()
+                "documentation": "\n".join(current_docs).strip()
             })
 
+        # Fallback only if nothing parsed
         if not results:
             print("⚠️ Batch parsing failed, using fallback")
-            results = [{"path": f.path, "documentation": "📝 Documentation generated"} for f in batch]
+            results = [
+                {"path": f.path, "documentation": "📝 Documentation generated"}
+                for f in batch
+            ]
 
         return results
+        # ------------------------------------------------
 
     except Exception as e:
         print(f"❌ Batch generation error: {e}")
-        return [{"path": f.path, "documentation": f"❌ Error: {str(e)[:100]}"} for f in batch]
+        return [
+            {"path": f.path, "documentation": f"❌ Error: {str(e)[:100]}"}
+            for f in batch
+        ]
+
 
 
 # ============================================================================
@@ -566,8 +585,8 @@ def worker_generate_docs(job_id: str, req: GenerateRequest):
             "progress": 100,
             "output_file": cached.doc_path
             })
-            print(f"✅ Using cached documentation from {cached.doc_path}")
-            return
+                print(f"✅ Using cached documentation from {cached.doc_path}")
+                return
         else:
             print(f"🔄 Cache bypassed - generating fresh documentation")
 
@@ -607,7 +626,7 @@ def worker_generate_docs(job_id: str, req: GenerateRequest):
         job_store[job_id]["status"] = "Exporting"
         job_store[job_id]["progress"] = 90
 
-        output_file = export_document(final_doc, req.format)
+        output_file = export_document(final_doc, req.format,req.template)
 
         folder = STORAGE_ROOT / sanitize_filename(cache_key) / commit_hash
         folder.mkdir(parents=True, exist_ok=True)

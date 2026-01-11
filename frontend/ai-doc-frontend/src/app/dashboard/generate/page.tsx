@@ -22,7 +22,17 @@ export default function GenerateDocsPage() {
   const [selectedBranch, setSelectedBranch] = useState<string>("");
   const [loadingBranches, setLoadingBranches] = useState(false);
   const [wasCached, setWasCached] = useState<boolean | null>(null);
+  const [template, setTemplate] = useState("minimal");
 
+  const templateOptions = [
+    { value: "minimal", label: "Minimal Clean", description: "Clean and simple design with plenty of whitespace" },
+    { value: "dark", label: "Dark Mode Developer", description: "Dark theme with neon accents for developers" },
+    { value: "notion", label: "Notion-Inspired", description: "Warm, friendly design inspired by Notion" },
+    { value: "gradient", label: "Modern Gradient", description: "Contemporary design with vibrant gradients" },
+    { value: "terminal", label: "Terminal Style", description: "Retro terminal aesthetic with green text" },
+    { value: "gitbook", label: "GitBook Style", description: "Professional documentation site layout" }
+  ];
+  const selectedTemplateInfo = templateOptions.find(t => t.value === template);
   async function startGeneration() {
     if (!repo) return;
     
@@ -40,6 +50,7 @@ export default function GenerateDocsPage() {
         theme,
         model,
         format,
+        template,
         use_cache: useCache,
       }),
     });
@@ -196,8 +207,51 @@ export default function GenerateDocsPage() {
                 <option value="beginner">Beginner Friendly</option>
                 <option value="api">API Reference</option>
               </select>
+              <p className="text-xs text-gray-500 mt-1">
+              Affects the writing style and detail level
+            </p>
             </div>
-  
+            <div className="border-t-2 border-gray-100 pt-6">
+            <label className="block text-sm font-semibold text-gray-700 mb-2">
+              UI Template
+            </label>
+            <select
+              value={template}
+              onChange={(e) => setTemplate(e.target.value)}
+              className="w-full rounded-lg border-2 border-gray-200 px-4 py-2.5
+                         focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent
+                         transition-all mb-3"
+            >
+              {templateOptions.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+            
+            {/* Template Preview Card */}
+            <div className="bg-linear-to-br from-gray-50 to-gray-100 rounded-lg p-4 border border-gray-200">
+              <div className="flex items-start space-x-3">
+                <div className="flex-shrink-0">
+                  {template === "minimal" && <span className="text-2xl">📄</span>}
+                  {template === "dark" && <span className="text-2xl">🌙</span>}
+                  {template === "notion" && <span className="text-2xl">📝</span>}
+                  {template === "gradient" && <span className="text-2xl">🎨</span>}
+                  {template === "terminal" && <span className="text-2xl">💻</span>}
+                  {template === "gitbook" && <span className="text-2xl">📚</span>}
+                </div>
+                <div>
+                  <h4 className="font-semibold text-gray-900">{selectedTemplateInfo?.label}</h4>
+                  <p className="text-sm text-gray-600 mt-1">
+                    {selectedTemplateInfo?.description}
+                  </p>
+                </div>
+              </div>
+            </div>
+            <p className="text-xs text-gray-500 mt-2">
+              Template only applies to HTML and PDF formats
+            </p>
+          </div>
             {/* Model + Format (2-column layout) */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
   
@@ -230,7 +284,8 @@ export default function GenerateDocsPage() {
                              focus:outline-none focus:ring-2 focus:ring-gray-900"
                 >
                   <option value="md">Markdown</option>
-                  <option value="pdf">PDF</option>
+                  {/* <option value="pdf">PDF</option> */}
+                  <option value="html">HTML</option>
                   <option value="docx">Word</option>
                 </select>
               </div>
